@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 #
-# Copyright (C) 2014, 2015 Carlos Jenkins <carlos@jenkins.co.cr>
+# Copyright (C) 2014, 2015, 2016 Carlos Jenkins <carlos@jenkins.co.cr>
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,7 +24,7 @@ from hashlib import sha1
 from json import loads, dumps
 from subprocess import Popen, PIPE
 from tempfile import mkstemp
-from os import access, X_OK, remove
+from os import access, X_OK, remove, fdopen
 from os.path import isfile, abspath, normpath, dirname, join, basename
 
 import requests
@@ -42,7 +42,6 @@ def index():
     """
 
     path = normpath(abspath(dirname(__file__)))
-    hooks = join(path, 'hooks')
 
     # Only POST is implemented
     if request.method != 'POST':
@@ -52,10 +51,12 @@ def index():
     with open(join(path, 'config.json'), 'r') as cfg:
         config = loads(cfg.read())
 
+    hooks = config.get('hooks_path', join(path, 'hooks'))
+
     # Allow Github IPs only
     if config.get('github_ips_only', True):
         src_ip = ip_address(
-            u'{}'.format(request.remote_addr)  # Fix stupid ipaddress issue
+            u'{}'.format(request.access_route[0])  # Fix stupid ipaddress issue
         )
         whitelist = requests.get('https://api.github.com/meta').json()['hooks']
 
@@ -63,18 +64,25 @@ def index():
             if src_ip in ip_network(valid_ip):
                 break
         else:
+            logging.error('IP {} not allowed'.format(
+                src_ip
+            ))
             abort(403)
 
     # Enforce secret
     secret = config.get('enforce_secret', '')
     if secret:
         # Only SHA1 is supported
-        sha_name, signature = request.headers.get('X-Hub-Signature').split('=')
+        header_signature = request.headers.get('X-Hub-Signature')
+        if header_signature is None:
+            abort(403)
+
+        sha_name, signature = header_signature.split('=')
         if sha_name != 'sha1':
             abort(501)
 
         # HMAC requires the key to be bytes, but data is string
-        mac = hmac.new(str(secret), msg=request.data, digestmod=sha1)
+        mac = hmac.new(str(secret), msg=request.data, digestmod='sha1')
 
         # Python prior to 2.7.7 does not have hmac.compare_digest
         if hexversion >= 0x020707F0:
@@ -94,8 +102,9 @@ def index():
 
     # Gather data
     try:
-        payload = loads(request.data)
-    except:
+        payload = request.get_json()
+    except Exception:
+        logging.warning('Request parsing failed')
         abort(400)
 
     # Determining the branch is tricky, as it only appears for certain event
@@ -117,7 +126,7 @@ def index():
 
         elif event in ['push']:
             # Push events provide a full Git ref in 'ref' and not a 'ref_type'.
-            branch = payload['ref'].split('/')[2]
+            branch = payload['ref'].split('/', 2)[2]
 
     except KeyError:
         # If the payload structure isn't what we expect, we'll live without
@@ -135,6 +144,11 @@ def index():
     }
     logging.info('Metadata:\n{}'.format(dumps(meta)))
 
+    # Skip push-delete
+    if event == 'push' and payload['deleted']:
+        logging.info('Skipping push-delete event for {}'.format(dumps(meta)))
+        return dumps({'status': 'skipped'})
+
     # Possible hooks
     scripts = []
     if branch and name:
@@ -147,11 +161,11 @@ def index():
     # Check permissions
     scripts = [s for s in scripts if isfile(s) and access(s, X_OK)]
     if not scripts:
-        return ''
+        return dumps({'status': 'nop'})
 
     # Save payload to temporal file
-    _, tmpfile = mkstemp()
-    with open(tmpfile, 'w') as pf:
+    osfd, tmpfile = mkstemp()
+    with fdopen(osfd, 'w') as pf:
         pf.write(dumps(payload))
 
     # Run scripts
@@ -166,8 +180,8 @@ def index():
 
         ran[basename(s)] = {
             'returncode': proc.returncode,
-            'stdout': stdout,
-            'stderr': stderr,
+            'stdout': stdout.decode('utf-8'),
+            'stderr': stderr.decode('utf-8'),
         }
 
         # Log errors if a hook failed
@@ -181,7 +195,7 @@ def index():
 
     info = config.get('return_scripts_info', False)
     if not info:
-        return ''
+        return dumps({'status': 'done'})
 
     output = dumps(ran, sort_keys=True, indent=4)
     logging.info(output)
